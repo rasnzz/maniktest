@@ -49,8 +49,12 @@ def init_db():
                     status TEXT DEFAULT 'active' CHECK(status IN ('active', 'canceled', 'completed')),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    reminder_sent BOOLEAN DEFAULT 0,
+                    cancel_reason TEXT DEFAULT '',
                     FOREIGN KEY(master_id) REFERENCES masters(id) ON DELETE RESTRICT,
                     FOREIGN KEY(service_id) REFERENCES services(id) ON DELETE RESTRICT)''')
+
+        
         
         # Проверяем наличие столбца reminder_sent и добавляем если нужно
         c.execute("PRAGMA table_info(appointments)")
@@ -59,6 +63,10 @@ def init_db():
         if 'reminder_sent' not in columns:
             c.execute("ALTER TABLE appointments ADD COLUMN reminder_sent BOOLEAN DEFAULT 0")
             logger.info("Добавлен столбец reminder_sent")
+
+        if 'cancel_reason' not in columns:
+            c.execute("ALTER TABLE appointments ADD COLUMN cancel_reason TEXT DEFAULT ''")
+            logger.info("Добавлен столбец cancel_reason")
         
         # Индексы для ускорения запросов
         c.execute("CREATE INDEX IF NOT EXISTS idx_appointments_date ON appointments(date)")
