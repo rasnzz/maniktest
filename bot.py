@@ -14,6 +14,7 @@ import pytz
 import logging
 from dotenv import load_dotenv
 import json
+import shlex
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -57,7 +58,7 @@ def get_masters():
     try:
         with get_db_connection() as conn:
             c = conn.cursor()
-            c.execute("SELECT id, name FROM masters")
+            c.execute("SELECT id, name FROM masters WHERE is_active = 1")
             return c.fetchall()
     except Exception as e:
         logger.error(f"Ошибка получения мастеров: {e}")
@@ -68,7 +69,7 @@ def get_services():
     try:
         with get_db_connection() as conn:
             c = conn.cursor()
-            c.execute("SELECT id, name, duration, price FROM services")
+            c.execute("SELECT id, name, duration, price FROM services WHERE is_active = 1")
             return c.fetchall()
     except Exception as e:
         logger.error(f"Ошибка получения услуг: {e}")
@@ -120,7 +121,7 @@ def init_google_sheet():
             
         headers = [
             "ID", "Дата записи", "Время", "Клиент", "Телефон",
-            "Мастер", "Услуга", "Длительность", "Цена", "Статус"
+            "Мастер", "Услуга", "Длительность", "Цена", "Статус", "Причина отмены"
         ]
         worksheet.clear()
         worksheet.append_row(headers)
@@ -128,7 +129,7 @@ def init_google_sheet():
     except Exception as e:
         logger.error(f"Ошибка инициализации Google Sheet: {e}")
 
-def update_google_sheet(appointment_id, action="add"):
+def update_google_sheet(appointment_id, action="add", reason=""):
     """Обновляет Google Sheets при изменениях"""
     try:
         worksheet = get_google_sheet()
@@ -139,7 +140,7 @@ def update_google_sheet(appointment_id, action="add"):
             c = conn.cursor()
             c.execute("""SELECT 
                         a.id, a.date, a.time, a.client_name, a.phone,
-                        m.name, s.name, s.duration, s.price, a.status
+                        m.name, s.name, s.duration, s.price, a.status, a.cancel_reason
                         FROM appointments a
                         JOIN masters m ON a.master_id = m.id
                         JOIN services s ON a.service_id = s.id
@@ -159,6 +160,12 @@ def update_google_sheet(appointment_id, action="add"):
             if cell:
                 for i, value in enumerate(row, start=1):
                     worksheet.update_cell(cell.row, i, value)
+        elif action == "cancel":
+            cell = worksheet.find(str(appointment_id))
+            if cell:
+                # Обновляем статус и причину отмены
+                worksheet.update_cell(cell.row, 10, "Отменено")
+                worksheet.update_cell(cell.row, 11, reason)
                 
     except Exception as e:
         logger.error(f"Ошибка обновления Google Sheet: {e}")
@@ -173,7 +180,7 @@ def sync_all_to_google():
         worksheet.clear()
         headers = [
             "ID", "Дата записи", "Время", "Клиент", "Телефон",
-            "Мастер", "Услуга", "Длительность", "Цена", "Статус"
+            "Мастер", "Услуга", "Длительность", "Цена", "Статус", "Причина отмены"
         ]
         worksheet.append_row(headers)
         
@@ -181,7 +188,7 @@ def sync_all_to_google():
             c = conn.cursor()
             c.execute("""SELECT 
                         a.id, a.date, a.time, a.client_name, a.phone,
-                        m.name, s.name, s.duration, s.price, a.status
+                        m.name, s.name, s.duration, s.price, a.status, a.cancel_reason
                         FROM appointments a
                         JOIN masters m ON a.master_id = m.id
                         JOIN services s ON a.service_id = s.id""")
@@ -200,73 +207,95 @@ def sync_all_to_google():
     except Exception as e:
         logger.error(f"Ошибка полной синхронизации: {e}")
 
-# --- Автоматические напоминания ---
+# --- Автоматические напоминания (исправленная версия) ---
 def send_reminders():
-    """Функция отправки напоминаний"""
+    """Функция отправки напоминаний за 12 часов и за 1 час до записи"""
     while True:
         try:
             # Текущее время в Оренбурге
             now = datetime.datetime.now(ORENBURG_TZ)
+            logger.info(f"Проверка напоминаний в {now}")
             
-            # Проверяем записи на завтра
-            tomorrow = now + datetime.timedelta(days=1)
-            date_str = tomorrow.strftime("%Y-%m-%d")
-            send_day_reminders(date_str, "завтра")
+            # Получаем все активные записи
+            with get_db_connection() as conn:
+                c = conn.cursor()
+                c.execute("""SELECT 
+                            a.id, a.client_id, a.client_name, a.date, a.time,
+                            m.name, s.name
+                            FROM appointments a
+                            JOIN masters m ON a.master_id = m.id
+                            JOIN services s ON a.service_id = s.id
+                            WHERE a.status = 'active'""")
+                appointments = c.fetchall()
             
-            # Проверяем записи на сегодня (если сейчас утро)
-            if now.hour < 10:  # Если сейчас утро (до 10:00)
-                today_str = now.strftime("%Y-%m-%d")
-                send_day_reminders(today_str, "сегодня")
+            for app in appointments:
+                app_id, client_id, client_name, date_str, time_str, master_name, service_name = app
+                
+                # Создаем объект datetime для записи
+                appointment_datetime = ORENBURG_TZ.localize(
+                    datetime.datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+                )
+                
+                # Вычисляем разницу во времени
+                time_diff = appointment_datetime - now
+                hours_diff = time_diff.total_seconds() / 3600
+                
+                # Определяем тип напоминания (12 часов или 1 час)
+                reminder_type = None
+                if 11.5 <= hours_diff <= 12.5:
+                    reminder_type = 12
+                elif 0.5 <= hours_diff <= 1.5:
+                    reminder_type = 1
+                
+                if not reminder_type:
+                    continue
+                
+                # Формируем сообщение в зависимости от типа напоминания
+                if reminder_type == 12:
+                    message = (
+                        f"⏰ Напоминание о записи!\n\n"
+                        f"Здравствуйте, {client_name}!\n"
+                        f"Через 12 часов у вас запись к мастеру {master_name}\n"
+                        f"Услуга: {service_name}\n"
+                        f"Время: {time_str}\n\n"
+                        f"📍 Адрес: {SALON_ADDRESS}\n"
+                        f"📱 Контакты: {SALON_PHONE}\n\n"
+                        f"Если не можете прийти, отмените запись через меню 'Мои записи'"
+                    )
+                else:
+                    message = (
+                        f"⏰ Напоминание о записи!\n\n"
+                        f"Здравствуйте, {client_name}!\n"
+                        f"Через 1 час у вас запись к мастеру {master_name}\n"
+                        f"Услуга: {service_name}\n"
+                        f"Время: {time_str}\n\n"
+                        f"📍 Адрес: {SALON_ADDRESS}\n"
+                        f"📱 Контакты: {SALON_PHONE}\n\n"
+                        f"Если не можете прийти, отмените запись через меню 'Мои записи'"
+                    )
+                
+                try:
+                    # Отправляем напоминание
+                    bot.send_message(client_id, message)
+                    logger.info(f"Отправлено напоминание за {reminder_type} часов клиенту {client_id}")
+                    
+                except Exception as e:
+                    # Если бот заблокирован, помечаем запись как отмененную
+                    if "bot was blocked" in str(e).lower():
+                        logger.warning(f"Клиент {client_id} заблокировал бота, отменяем запись")
+                        with get_db_connection() as conn:
+                            c = conn.cursor()
+                            c.execute("UPDATE appointments SET status='canceled' WHERE id=?", (app_id,))
+                            conn.commit()
+                    else:
+                        logger.error(f"Ошибка отправки напоминания за {reminder_type} часов: {e}")
             
-            # Проверяем каждые 1 час
-            time.sleep(3600)
+            # Проверяем каждые 30 минут
+            time.sleep(1800)
             
         except Exception as e:
             logger.error(f"Ошибка в потоке напоминаний: {e}")
             time.sleep(60)
-
-def send_day_reminders(date_str, day_text):
-    """Отправляет напоминания на конкретный день"""
-    try:
-        with get_db_connection() as conn:
-            c = conn.cursor()
-            c.execute("""SELECT 
-                        a.id, a.client_id, a.client_name, a.time,
-                        m.name, s.name
-                        FROM appointments a
-                        JOIN masters m ON a.master_id = m.id
-                        JOIN services s ON a.service_id = s.id
-                        WHERE a.date = ? AND a.status = 'active'""", (date_str,))
-            appointments = c.fetchall()
-        
-        for app in appointments:
-            app_id, client_id, client_name, app_time, master_name, service_name = app
-            message = (
-                f"⏰ Напоминание о записи!\n\n"
-                f"Здравствуйте, {client_name}!\n"
-                f"{day_text.capitalize()} в {app_time} у вас запись к мастеру {master_name}\n"
-                f"Услуга: {service_name}\n\n"
-                f"📍 Адрес: {SALON_ADDRESS}\n"
-                f"📱 Контакты: {SALON_PHONE}\n\n"
-                f"Если не можете прийти, отмените запись через меню 'Мои записи'"
-            )
-            try:
-                bot.send_message(client_id, message)
-                logger.info(f"Отправлено напоминание клиенту {client_id}")
-                
-            except Exception as e:
-                # Если пользователь заблокировал бота, помечаем запись
-                if "bot was blocked" in str(e).lower():
-                    logger.warning(f"Клиент {client_id} заблокировал бота, отменяем запись")
-                    with get_db_connection() as conn:
-                        c = conn.cursor()
-                        c.execute("UPDATE appointments SET status='canceled' WHERE id=?", (app_id,))
-                        conn.commit()
-                else:
-                    logger.error(f"Не удалось отправить напоминание {client_id}: {e}")
-    
-    except Exception as e:
-        logger.error(f"Ошибка отправки напоминаний на {date_str}: {e}")
 
 # --- Основные обработчики бота ---
 def show_main_menu(chat_id):
@@ -912,13 +941,13 @@ def export_to_excel(message):
         ws = wb.active
         ws.title = "Расписание"
         
-        headers = ["ID", "Дата", "Время", "Клиент", "Телефон", "Мастер", "Услуга"]
+        headers = ["ID", "Дата", "Время", "Клиент", "Телефон", "Мастер", "Услуга", "Статус"]
         ws.append(headers)
         
         for app in appointments:
             app_id, client_name, phone, master_name, service_name, date, time = app
             date_formatted = datetime.datetime.strptime(date, '%Y-%m-%d').strftime('%d.%m.%Y')
-            ws.append([app_id, date_formatted, time, client_name, phone, master_name, service_name])
+            ws.append([app_id, date_formatted, time, client_name, phone, master_name, service_name, "Активна"])
         
         for col in range(1, len(headers) + 1):
             cell = ws.cell(row=1, column=col)
@@ -957,35 +986,149 @@ def sync_google_sheet(message):
         logger.error(f"Ошибка синхронизации с Google Sheets: {e}")
         bot.send_message(message.chat.id, f"❌ Ошибка синхронизации: {str(e)}")
 
-@bot.message_handler(func=lambda message: message.text.startswith('/cancel_') and message.chat.id in ADMIN_CHAT_IDS)
-def cancel_appointment(message):
-    """Отменяет запись по ID"""
+# --- Команды администрирования записей ---
+@bot.message_handler(commands=['cancel'])
+def admin_cancel_appointment(message):
+    """Отменяет запись по ID с указанием причины"""
+    if message.chat.id not in ADMIN_CHAT_IDS:
+        return
+    
     try:
-        appointment_id = message.text.split('_')[1]
+        # Формат команды: /cancel <ID_записи> <Причина>
+        parts = message.text.split(' ', 2)
+        if len(parts) < 3:
+            bot.send_message(message.chat.id, "❌ Формат команды: /cancel <ID_записи> <Причина>")
+            return
+            
+        appointment_id = int(parts[1])
+        reason = parts[2]
+        
+        # Получаем детали записи
         with get_db_connection() as conn:
             c = conn.cursor()
-            c.execute("UPDATE appointments SET status='canceled' WHERE id=?", (appointment_id,))
+            c.execute("""SELECT 
+                        a.client_id, a.client_name, a.date, a.time,
+                        m.name, s.name
+                        FROM appointments a
+                        JOIN masters m ON a.master_id = m.id
+                        JOIN services s ON a.service_id = s.id
+                        WHERE a.id = ? AND a.status = 'active'""", (appointment_id,))
+            appointment = c.fetchone()
+            
+        if not appointment:
+            bot.send_message(message.chat.id, "❌ Активная запись с таким ID не найдена")
+            return
+            
+        client_id, client_name, date, time, master_name, service_name = appointment
+        
+        # Обновляем статус записи
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            c.execute("""UPDATE appointments 
+                       SET status='canceled', cancel_reason = ?
+                       WHERE id=?""", (reason, appointment_id))
             conn.commit()
-            
-            c.execute("SELECT client_id, date, time FROM appointments WHERE id=?", (appointment_id,))
-            result = c.fetchone()
         
-        if result:
-            client_id, date, time = result
-            # Обновляем Google Sheets
-            update_google_sheet(appointment_id, "update")
-            
-            # Уведомляем клиента
-            date_formatted = datetime.datetime.strptime(date, '%Y-%m-%d').strftime('%d.%m.%Y')
+        # Уведомляем клиента
+        date_formatted = datetime.datetime.strptime(date, '%Y-%m-%d').strftime('%d.%m.%Y')
+        try:
             bot.send_message(
-                client_id, 
-                f"❗ Ваша запись на {date_formatted} в {time} отменена администратором"
+                client_id,
+                f"❗ Ваша запись отменена администратором\n\n"
+                f"⏰ {date_formatted} в {time}\n"
+                f"👩‍🎨 Мастер: {master_name}\n"
+                f"💅 Услуга: {service_name}\n\n"
+                f"Причина: {reason}\n\n"
+                f"Пожалуйста, запишитесь на другое время."
             )
+        except Exception as e:
+            logger.error(f"Не удалось уведомить клиента {client_id}: {e}")
         
-        bot.send_message(message.chat.id, f"✅ Запись #{appointment_id} отменена")
+        # Обновляем Google Sheets
+        update_google_sheet(appointment_id, "cancel", reason)
+        bot.send_message(message.chat.id, f"✅ Запись #{appointment_id} отменена. Клиент уведомлен.")
+        
     except Exception as e:
-        logger.error(f"Ошибка отмены записи: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка отмены записи. Используйте: /cancel_ID")
+        logger.error(f"Ошибка отмены записи администратором: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка при обработке команды")
+
+@bot.message_handler(commands=['addappointment'])
+def admin_add_appointment(message):
+    """Ручное добавление записи администратором"""
+    if message.chat.id not in ADMIN_CHAT_IDS:
+        return
+        
+    try:
+        # Формат: /addappointment "Имя клиента" "+79123456789" "Имя мастера" "Услуга" 2023-12-31 15:30
+        parts = shlex.split(message.text)[1:]
+        
+        if len(parts) < 6:
+            bot.send_message(message.chat.id, "❌ Формат команды:\n"
+                          "/addappointment \"Имя клиента\" \"Телефон\" \"Имя мастера\" \"Услуга\" ГГГГ-ММ-ДД ЧЧ:ММ")
+            return
+            
+        client_name, phone, master_name, service_name, date, time = parts[:6]
+        
+        # Проверка формата даты и времени
+        try:
+            datetime.datetime.strptime(date, '%Y-%m-%d')
+            datetime.datetime.strptime(time, '%H:%M')
+        except ValueError:
+            bot.send_message(message.chat.id, "❌ Неверный формат даты или времени\n"
+                          "Используйте: ГГГГ-ММ-ДД и ЧЧ:ММ")
+            return
+        
+        # Ищем мастера и услугу в БД
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            
+            # Поиск мастера
+            c.execute("SELECT id FROM masters WHERE name = ?", (master_name,))
+            master = c.fetchone()
+            if not master:
+                bot.send_message(message.chat.id, f"❌ Мастер '{master_name}' не найден")
+                return
+            master_id = master[0]
+            
+            # Поиск услуги
+            c.execute("SELECT id, duration FROM services WHERE name = ?", (service_name,))
+            service = c.fetchone()
+            if not service:
+                bot.send_message(message.chat.id, f"❌ Услуга '{service_name}' не найдена")
+                return
+            service_id = service[0]
+            duration = service[1]
+            
+            # Проверка доступности времени
+            c.execute("""SELECT 1 FROM appointments 
+                      WHERE master_id = ? AND date = ? AND time = ? AND status = 'active'""",
+                      (master_id, date, time))
+            if c.fetchone():
+                bot.send_message(message.chat.id, "❌ Это время уже занято")
+                return
+        
+        # Создаем фейковый state
+        state = {
+            'client_name': client_name,
+            'phone': phone,
+            'master_id': master_id,
+            'service_id': service_id,
+            'date': date,
+            'time': time,
+            'duration': duration
+        }
+        
+        # Сохраняем запись (client_id=0 для системных записей)
+        appointment_id = save_appointment(0, state)
+        if appointment_id:
+            update_google_sheet(appointment_id, "add")
+            bot.send_message(message.chat.id, f"✅ Запись успешно создана! ID: {appointment_id}")
+        else:
+            bot.send_message(message.chat.id, "❌ Ошибка при создании записи")
+            
+    except Exception as e:
+        logger.error(f"Ошибка добавления записи администратором: {e}")
+        bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
 
 # --- Фоновая синхронизация ---
 def background_sync():
